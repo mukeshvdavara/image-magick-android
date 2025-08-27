@@ -1,91 +1,348 @@
-name: Build ImageMagick for Android
+name: Android ImageMagick (NDK r28, API 35, wide delegates)
 
 on:
-  workflow_dispatch:   # Manual trigger
-  push:
-    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+
+    env:
+      ANDROID_API: "35"
+      # NDK r28 (stable) exact version:
+      ANDROID_NDK_VERSION: "28.0.13004108"
+      # Versions (locked to released tarballs with stable, non-broken URLs)
+      IMAGEMAGICK_VER: "7.1.2-2"
+      ZLIB_VER: "1.3.1"
+      LIBPNG_VER: "1.6.44"
+      LIBJPEG_TURBO_VER: "3.0.4"
+      LIBTIFF_VER: "4.7.0"
+      LIBWEBP_VER: "1.4.0" # if 1.6.0 is available at build time, bump safely
+      OPENJPEG_VER: "2.5.3"
+      LCMS2_VER: "2.17"
+      LIBEXIF_VER: "0.6.24"
+      IMATH_VER: "3.1.12"
+      OPENEXR_VER: "3.3.4"
+      LIBRAW_VER: "0.21.4"
+      BROTLI_VER: "1.1.0"
+      HIGHWAY_VER: "1.2.0"
+      LIBJXL_VER: "0.11.1"
+      LIBDE265_VER: "1.0.15"
+      LIBHEIF_VER: "1.20.2"
+      LIBAOM_VER: "3.12.1"
+      LIBAVIF_VER: "1.1.1"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Install dependencies
+      - name: Set up Java (for sdkmanager)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages (platform 35, build-tools)
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-${ANDROID_API}" "platform-tools" "build-tools;35.0.0"
+
+      - name: Set up NDK r28
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.ANDROID_NDK_VERSION }}
+
+      - name: Install build prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git wget cmake autoconf automake libtool pkg-config yasm nasm
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config \
+            cmake ninja-build meson nasm yasm curl ca-certificates \
+            texinfo bison flex git python3
 
-      - name: Download Android NDK
+      - name: Prepare directories
+        id: prep
         run: |
-          wget https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
-          unzip android-ndk-r28b-linux.zip -d $HOME
-          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r28b" >> $GITHUB_ENV
+          set -euxo pipefail
+          echo "work=$PWD" >> $GITHUB_OUTPUT
+          mkdir -p downloads src build prefix/${{ matrix.abi }}
 
-      - name: Setup environment
+      - name: Build (all deps + ImageMagick)
+        shell: bash
+        env:
+          ABI: ${{ matrix.abi }}
         run: |
-          export API=35
-          export TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
-          export TARGET=aarch64-linux-android
-          export AR=$TOOLCHAIN/bin/llvm-ar
-          export AS=$TOOLCHAIN/bin/llvm-as
-          export CC=$TOOLCHAIN/bin/$TARGET$API-clang
-          export CXX=$TOOLCHAIN/bin/$TARGET$API-clang++
-          export LD=$TOOLCHAIN/bin/ld
-          export RANLIB=$TOOLCHAIN/bin/llvm-ranlib
-          export STRIP=$TOOLCHAIN/bin/llvm-strip
-          echo "PREFIX=$GITHUB_WORKSPACE/install" >> $GITHUB_ENV
+          set -euxo pipefail
 
-      - name: Build lcms2
-        run: |
-          git clone --depth 1 https://github.com/mm2/Little-CMS/lcms2.git
-          cd lcms2
-          ./configure --host=$TARGET --prefix=$PREFIX
-          make -j$(nproc)
+          WORK="$PWD"
+          DL="$WORK/downloads"
+          SRC="$WORK/src"
+          INSTALL="$WORK/prefix/${ABI}"
+
+          ANDROID_NDK="$NDK_HOME"
+
+          case "$ABI" in
+            arm64-v8a)
+              TRIPLE=aarch64-linux-android
+              ;;
+            armeabi-v7a)
+              TRIPLE=armv7a-linux-androideabi
+              ;;
+            x86_64)
+              TRIPLE=x86_64-linux-android
+              ;;
+          esac
+
+          # Compilers
+          export AR="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          export RANLIB="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ranlib"
+          export STRIP="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          export CC="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${TRIPLE}${ANDROID_API}-clang"
+          export CXX="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/${TRIPLE}${ANDROID_API}-clang++"
+
+          export CFLAGS="-fPIC -O3"
+          export CXXFLAGS="-fPIC -O3 -std=c++17"
+          export LDFLAGS="-L${INSTALL}/lib"
+          export CPPFLAGS="-I${INSTALL}/include"
+
+          export PKG_CONFIG="$(/usr/bin/which pkg-config)"
+          export PKG_CONFIG_LIBDIR="${INSTALL}/lib/pkgconfig:${INSTALL}/share/pkgconfig"
+          export PKG_CONFIG_PATH="${PKG_CONFIG_LIBDIR}"
+          export PATH="${INSTALL}/bin:${PATH}"
+
+          cmake_toolchain="${ANDROID_NDK}/build/cmake/android.toolchain.cmake"
+
+          fetch () {
+            # $1=url  $2=outfile
+            mkdir -p "$DL"
+            [ -f "$DL/$2" ] || curl -L --fail --retry 5 -o "$DL/$2" "$1"
+          }
+
+          extract () {
+            # $1=tarball  $2=targetdir
+            mkdir -p "$SRC"
+            cd "$SRC"
+            rm -rf "$2"
+            mkdir -p "$2"
+            tar xf "$DL/$1" -C "$2" --strip-components=1
+          }
+
+          cmake_build () {
+            # $1=name $2=srcdir-rel $3=extra-cmake-args...
+            local name="$1"; local sdir="$2"; shift 2
+            local bdir="$WORK/build/${ABI}-${name}"
+            rm -rf "$bdir"; mkdir -p "$bdir"; cd "$bdir"
+            cmake -G Ninja "$SRC/$sdir" \
+              -DCMAKE_TOOLCHAIN_FILE="${cmake_toolchain}" \
+              -DANDROID_ABI="${ABI}" \
+              -DANDROID_PLATFORM="android-${ANDROID_API}" \
+              -DANDROID_STL=c++_shared \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+              -DCMAKE_INSTALL_PREFIX="${INSTALL}" \
+              -DCMAKE_PREFIX_PATH="${INSTALL}" \
+              -DCMAKE_FIND_ROOT_PATH="${INSTALL}" \
+              "$@"
+            ninja -v
+            ninja install
+          }
+
+          autotools_build () {
+            # $1=name $2=srcdir-rel $3=extra-configure-args...
+            local name="$1"; local sdir="$2"; shift 2
+            cd "$SRC/$sdir"
+            [ -f configure ] || autoreconf -fi
+            ./configure --host="${TRIPLE}" --prefix="${INSTALL}" \
+              --disable-shared --enable-static "$@"
+            make -j"$(nproc)"
+            make install
+          }
+
+          # -------------------------
+          # Download release tarballs
+          # -------------------------
+
+          # Core libs
+          fetch "https://zlib.net/zlib-${ZLIB_VER}.tar.gz" "zlib-${ZLIB_VER}.tar.gz"
+          fetch "https://download.sourceforge.net/libpng/libpng-${LIBPNG_VER}.tar.xz" "libpng-${LIBPNG_VER}.tar.xz"
+          fetch "https://downloads.sourceforge.net/project/libjpeg-turbo/${LIBJPEG_TURBO_VER}/libjpeg-turbo-${LIBJPEG_TURBO_VER}.tar.gz" "libjpeg-turbo-${LIBJPEG_TURBO_VER}.tar.gz"
+          fetch "https://download.osgeo.org/libtiff/tiff-${LIBTIFF_VER}.tar.gz" "tiff-${LIBTIFF_VER}.tar.gz"
+          fetch "https://github.com/webmproject/libwebp/archive/refs/tags/v${LIBWEBP_VER}.tar.gz" "libwebp-${LIBWEBP_VER}.tar.gz"
+          fetch "https://github.com/uclouvain/openjpeg/archive/refs/tags/v${OPENJPEG_VER}.tar.gz" "openjpeg-${OPENJPEG_VER}.tar.gz"
+          fetch "https://github.com/mm2/Little-CMS/releases/download/lcms2.${LCMS2_VER}/lcms2-${LCMS2_VER}.tar.gz" "lcms2-${LCMS2_VER}.tar.gz"
+          fetch "https://github.com/libexif/libexif/releases/download/v${LIBEXIF_VER}/libexif-${LIBEXIF_VER}.tar.bz2" "libexif-${LIBEXIF_VER}.tar.bz2"
+
+          # JPEG XL deps
+          fetch "https://github.com/google/brotli/archive/refs/tags/v${BROTLI_VER}.tar.gz" "brotli-${BROTLI_VER}.tar.gz"
+          fetch "https://github.com/google/highway/archive/refs/tags/${HIGHWAY_VER}.tar.gz" "highway-${HIGHWAY_VER}.tar.gz"
+          fetch "https://github.com/libjxl/libjxl/archive/refs/tags/v${LIBJXL_VER}.tar.gz" "libjxl-${LIBJXL_VER}.tar.gz"
+
+          # OpenEXR stack
+          fetch "https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v${IMATH_VER}.tar.gz" "Imath-${IMATH_VER}.tar.gz"
+          fetch "https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v${OPENEXR_VER}.tar.gz" "openexr-${OPENEXR_VER}.tar.gz"
+
+          # RAW
+          fetch "https://www.libraw.org/data/LibRaw-${LIBRAW_VER}.tar.gz" "LibRaw-${LIBRAW_VER}.tar.gz"
+
+          # HEIF/AVIF stack
+          fetch "https://github.com/strukturag/libde265/archive/refs/tags/v${LIBDE265_VER}.tar.gz" "libde265-${LIBDE265_VER}.tar.gz"
+          fetch "https://github.com/strukturag/libheif/archive/refs/tags/v${LIBHEIF_VER}.tar.gz" "libheif-${LIBHEIF_VER}.tar.gz"
+          # aom: official tar via googlesource (gitiles archive)
+          curl -L --fail --retry 5 -o "${DL}/aom-v${LIBAOM_VER}.tar.gz" "https://aomedia.googlesource.com/aom/+archive/refs/tags/v${LIBAOM_VER}.tar.gz"
+          fetch "https://github.com/AOMediaCodec/libavif/archive/refs/tags/v${LIBAVIF_VER}.tar.gz" "libavif-${LIBAVIF_VER}.tar.gz"
+
+          # ImageMagick
+          fetch "https://imagemagick.org/archive/ImageMagick-${IMAGEMAGICK_VER}.tar.gz" "ImageMagick-${IMAGEMAGICK_VER}.tar.gz"
+
+          # -------------------------
+          # Extract
+          # -------------------------
+          extract "zlib-${ZLIB_VER}.tar.gz" "zlib"
+          extract "libpng-${LIBPNG_VER}.tar.xz" "libpng"
+          extract "libjpeg-turbo-${LIBJPEG_TURBO_VER}.tar.gz" "libjpeg-turbo"
+          extract "tiff-${LIBTIFF_VER}.tar.gz" "libtiff"
+          extract "libwebp-${LIBWEBP_VER}.tar.gz" "libwebp"
+          extract "openjpeg-${OPENJPEG_VER}.tar.gz" "openjpeg"
+          extract "lcms2-${LCMS2_VER}.tar.gz" "lcms2"
+          extract "libexif-${LIBEXIF_VER}.tar.bz2" "libexif"
+          extract "brotli-${BROTLI_VER}.tar.gz" "brotli"
+          extract "highway-${HIGHWAY_VER}.tar.gz" "highway"
+          extract "libjxl-${LIBJXL_VER}.tar.gz" "libjxl"
+          extract "Imath-${IMATH_VER}.tar.gz" "Imath"
+          extract "openexr-${OPENEXR_VER}.tar.gz" "openexr"
+          extract "LibRaw-${LIBRAW_VER}.tar.gz" "libraw"
+          extract "libde265-${LIBDE265_VER}.tar.gz" "libde265"
+          extract "libheif-${LIBHEIF_VER}.tar.gz" "libheif"
+          # aom needs special extraction (no top directory in gitiles archive)
+          rm -rf "$SRC/aom" && mkdir -p "$SRC/aom" && tar xf "${DL}/aom-v${LIBAOM_VER}.tar.gz" -C "$SRC/aom"
+          extract "libavif-${LIBAVIF_VER}.tar.gz" "libavif"
+          extract "ImageMagick-${IMAGEMAGICK_VER}.tar.gz" "imagemagick"
+
+          # -------------------------
+          # Build: core
+          # -------------------------
+          cmake_build zlib zlib -DBUILD_SHARED_LIBS=OFF
+          cmake_build libpng libpng -DPNG_SHARED=OFF -DPNG_TESTS=OFF
+
+          cmake_build libjpeg-turbo libjpeg-turbo \
+            -DENABLE_SHARED=OFF \
+            -DWITH_JPEG8=ON \
+            -DCMAKE_ASM_NASM_COMPILER="$(command -v nasm || true)"
+
+          cmake_build openjpeg openjpeg \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTS=OFF -DBUILD_PKGCONFIG_FILES=ON \
+            -DOPJ_USE_THREAD=ON
+
+          autotools_build lcms2 lcms2 --with-jpeg=yes --with-tiff=yes
+
+          autotools_build libexif libexif
+
+          cmake_build libwebp libwebp \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF \
+            -DWEBP_BUILD_EXTRAS=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF
+
+          # libtiff (link to zlib & jpeg; keep tools/tests off)
+          cmake_build libtiff libtiff \
+            -DBUILD_SHARED_LIBS=OFF \
+            -Dtiff-tools=OFF -Dtiff-tests=OFF \
+            -Djbig=OFF -Dzstd=OFF -Dlzma=OFF \
+            -Djpegturbo_DIR="${INSTALL}"
+
+          # -------------------------
+          # Build: JPEG XL stack
+          # -------------------------
+          cmake_build brotli brotli \
+            -DBUILD_SHARED_LIBS=OFF -DBROTLI_DISABLE_TESTS=ON -DBROTLI_BUNDLED_MODE=OFF
+
+          cmake_build highway highway -DBUILD_SHARED_LIBS=OFF -DHWY_SYSTEM_GTEST=OFF
+
+          cmake_build libjxl libjxl \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DJPEGXL_ENABLE_TOOLS=OFF \
+            -DJPEGXL_ENABLE_BENCHMARK=OFF \
+            -DJPEGXL_ENABLE_EXAMPLES=OFF \
+            -DJPEGXL_ENABLE_MANPAGES=OFF \
+            -DJPEGXL_ENABLE_SKCMS=OFF \
+            -DJPEGXL_ENABLE_VIEWERS=OFF
+
+          # -------------------------
+          # Build: OpenEXR stack
+          # -------------------------
+          cmake_build Imath Imath -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF
+          cmake_build openexr openexr \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DOPENEXR_BUILD_TESTS=OFF -DOPENEXR_BUILD_TOOLS=OFF
+
+          # -------------------------
+          # Build: RAW
+          # -------------------------
+          cmake_build libraw libraw \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_LCMS=ON \
+            -DLIBRAW_BUILD_TESTS=OFF
+
+          # -------------------------
+          # Build: HEIF/AVIF stack
+          # -------------------------
+          cmake_build libde265 libde265 \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_DECODER=ON -DENABLE_ENCODER=OFF -DENABLE_TOOLS=OFF -DENABLE_TESTS=OFF
+
+          cmake_build aom aom \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_DOCS=OFF -DENABLE_TESTS=OFF -DENABLE_TOOLS=OFF
+
+          cmake_build libavif libavif \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DAVIF_CODEC_AOM=ON -DAVIF_BUILD_APPS=OFF -DAVIF_BUILD_TESTS=OFF
+
+          cmake_build libheif libheif \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWITH_AOM=ON \
+            -DWITH_DE265=ON \
+            -DWITH_X265=OFF \
+            -DWITH_RAV1E=OFF -DWITH_DAV1D=OFF -DWITH_SvtEnc=OFF \
+            -DENABLE_PLUGIN_LOADING=OFF
+
+          # -------------------------
+          # Build: ImageMagick
+          # -------------------------
+          cd "$SRC/imagemagick"
+          # Prevent running target binaries during configure (cross env)
+          export ac_cv_func_mmap_fixed_mapped=yes
+          export gl_cv_func_getopt_gnu=yes
+
+          ./configure --host="${TRIPLE}" --prefix="${INSTALL}" \
+            --disable-shared --enable-static \
+            --without-modules \
+            --with-quantum-depth=16 \
+            --without-x \
+            --without-perl \
+            --disable-opencl \
+            --disable-docs
+
+          make -j"$(nproc)"
           make install
 
-      - name: Build libde265
-        run: |
-          git clone --depth 1 https://github.com/strukturag/libde265.git
-          cd libde265
-          ./autogen.sh
-          ./configure --host=$TARGET --prefix=$PREFIX
-          make -j$(nproc)
-          make install
+          # Package the prefix for this ABI
+          cd "$WORK"
+          tar -C "prefix/${ABI}" -czf "ImageMagick-android-${ABI}.tar.gz" .
 
-      - name: Build libheif
-        run: |
-          git clone --depth 1 https://github.com/strukturag/libheif.git
-          cd libheif
-          ./autogen.sh
-          ./configure --host=$TARGET --prefix=$PREFIX
-          make -j$(nproc)
-          make install
-
-      - name: Build libaom (for AVIF)
-        run: |
-          git clone --depth 1 https://aomedia.googlesource.com/aom
-          cd aom
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN/../build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-35 \
-            -DCMAKE_INSTALL_PREFIX=$PREFIX
-          cmake --build build -j$(nproc)
-          cmake --install build
-
-      - name: Build ImageMagick
-        run: |
-          git clone --depth 1 https://github.com/ImageMagick/ImageMagick.git
-          cd ImageMagick
-          ./configure --host=$TARGET --prefix=$PREFIX \
-            --with-heic=yes --with-lcms=yes --with-avif=yes
-          make -j$(nproc)
-          make install
-
-      - name: Upload artifacts
+      - name: Upload artifacts (per-ABI)
         uses: actions/upload-artifact@v4
         with:
-          name: imagemagick-android
-          path: install/
+          name: ImageMagick-android-${{ matrix.abi }}
+          path: ImageMagick-android-${{ matrix.abi }}.tar.gz
+          if-no-files-found: error
