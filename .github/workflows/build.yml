@@ -1,0 +1,91 @@
+name: Build ImageMagick for Android
+
+on:
+  workflow_dispatch:   # Manual trigger
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git wget cmake autoconf automake libtool pkg-config yasm nasm
+
+      - name: Download Android NDK
+        run: |
+          wget https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          unzip android-ndk-r28b-linux.zip -d $HOME
+          echo "ANDROID_NDK_HOME=$HOME/android-ndk-r28b" >> $GITHUB_ENV
+
+      - name: Setup environment
+        run: |
+          export API=35
+          export TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64
+          export TARGET=aarch64-linux-android
+          export AR=$TOOLCHAIN/bin/llvm-ar
+          export AS=$TOOLCHAIN/bin/llvm-as
+          export CC=$TOOLCHAIN/bin/$TARGET$API-clang
+          export CXX=$TOOLCHAIN/bin/$TARGET$API-clang++
+          export LD=$TOOLCHAIN/bin/ld
+          export RANLIB=$TOOLCHAIN/bin/llvm-ranlib
+          export STRIP=$TOOLCHAIN/bin/llvm-strip
+          echo "PREFIX=$GITHUB_WORKSPACE/install" >> $GITHUB_ENV
+
+      - name: Build lcms2
+        run: |
+          git clone --depth 1 https://github.com/mm2/Little-CMS/lcms2.git
+          cd lcms2
+          ./configure --host=$TARGET --prefix=$PREFIX
+          make -j$(nproc)
+          make install
+
+      - name: Build libde265
+        run: |
+          git clone --depth 1 https://github.com/strukturag/libde265.git
+          cd libde265
+          ./autogen.sh
+          ./configure --host=$TARGET --prefix=$PREFIX
+          make -j$(nproc)
+          make install
+
+      - name: Build libheif
+        run: |
+          git clone --depth 1 https://github.com/strukturag/libheif.git
+          cd libheif
+          ./autogen.sh
+          ./configure --host=$TARGET --prefix=$PREFIX
+          make -j$(nproc)
+          make install
+
+      - name: Build libaom (for AVIF)
+        run: |
+          git clone --depth 1 https://aomedia.googlesource.com/aom
+          cd aom
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN/../build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-35 \
+            -DCMAKE_INSTALL_PREFIX=$PREFIX
+          cmake --build build -j$(nproc)
+          cmake --install build
+
+      - name: Build ImageMagick
+        run: |
+          git clone --depth 1 https://github.com/ImageMagick/ImageMagick.git
+          cd ImageMagick
+          ./configure --host=$TARGET --prefix=$PREFIX \
+            --with-heic=yes --with-lcms=yes --with-avif=yes
+          make -j$(nproc)
+          make install
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: imagemagick-android
+          path: install/
